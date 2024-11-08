@@ -1,6 +1,7 @@
 import numpy as np
 from .base import GravitationalWaveTransient
 import pickle
+from ..utils import noise_weighted_inner_product, zenith_azimuth_to_ra_dec, ln_i0
 from scipy.stats import chi2
 
 class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
@@ -46,6 +47,7 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
     def noise_log_likelihood(self):
         
         if self._noise_log_likelihood_value is None:
+
             # calling method from GravitationalWaveTransient which is really calcualting the data inner product
             noise_gamma = np.sqrt(-self._calculate_noise_log_likelihood())
 
@@ -70,10 +72,9 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
 
         gamma = self._compute_gamma(waveform_polarizations)
 
-        return self.loglikelihood_object.score_samples(np.array(gamma).reshape(1, -1) )
+        return self.loglikelihood_object.score_samples(np.array(gamma).reshape(1, -1) )[0]
 
         
     def log_likelihood(self):
 
-        
         return self.empirical_log_likelihood()
