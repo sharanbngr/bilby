@@ -7,6 +7,7 @@ import bilby
 from gwpy.timeseries import TimeSeries
 from gwpy.spectrogram import Spectrogram
 from sklearn.neighbors import KernelDensity
+import matplotlib.pyplot as plt
 
 
 class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
@@ -34,7 +35,6 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
             time_reference=time_reference)
 
 
-
         if generate_gaussian_background:
             self.loglikelihood_object = self._gaussian_background_distribution(interferometers)
 
@@ -55,7 +55,7 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
         # Assume that background duration is 64 times the analysis duration
         # This will give O(64*64) = 4000 time slides for two detectors
         analysis_duration = int(ifo.duration)
-        background_duration = 64 * analysis_duration
+        background_duration = 128 * analysis_duration
         sampling_frequency = int(ifo.sampling_frequency)
         minimum_frequency, maximum_frequency = ifo.minimum_frequency, ifo.maximum_frequency
         start_time = ifo.start_time - 0.5*background_duration
@@ -132,20 +132,22 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
                                                    L1_psd, 
                                                    analysis_duration):
 
+
         H1_inner = (4 * np.abs(H1)**2 / H1_psd ).sum(axis=1) / analysis_duration
         L1_inner = (4 * np.abs(L1)**2 / L1_psd ).sum(axis=1) / analysis_duration
 
 
-
         gamma = np.array([])
 
+
         #for ii in range(20):
-        for ii in range(int(0.75*H1_inner.size)):
+        for ii in range(int(0.5*H1_inner.size)):
             time_shift_gamma = np.sqrt(H1_inner + np.roll(L1_inner, ii + 1))
             gamma = np.append(gamma, time_shift_gamma)
 
+        #gamma = np.sqrt(np.random.chisquare(2*2*H1_psd.size, size=5000))
         kde = KernelDensity(kernel='gaussian', 
-                        bandwidth=1.0).fit(gamma.reshape(gamma.size, 1))
+                        bandwidth='scott').fit(gamma.reshape(gamma.size, 1))
 
         return kde
 
@@ -156,7 +158,7 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
         d_inner_h, h_inner_h = self._calculate_inner_products(waveform_polarizations)
 
         # calling method from GravitationalWaveTransient which is really calcualting the data inner product
-        d_inner_d = -self._calculate_noise_log_likelihood()
+        d_inner_d = -2 * self._calculate_noise_log_likelihood()
 
         return  np.sqrt(d_inner_d  + h_inner_h - 2 * np.real(d_inner_h))
 
@@ -166,21 +168,23 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
         if self._noise_log_likelihood_value is None:
 
             # calling method from GravitationalWaveTransient which is really calcualting the data inner product
-            noise_gamma = np.sqrt(-self._calculate_noise_log_likelihood())
+            noise_gamma = np.sqrt(-2 * self._calculate_noise_log_likelihood())
 
             n_frequency_bins = self.interferometers[0].frequency_mask.sum()
             n_detectors = len(self.interferometers)
 
             n_dof = 2*n_frequency_bins*n_detectors
 
-            self._noise_log_likelihood_value = np.log(2*noise_gamma) + chi2.logpdf(noise_gamma, n_dof)
+            noise_log_likelihood_gamma = self.loglikelihood_object.score_samples(np.array(noise_gamma).reshape(1, -1) )[0]
+
+            self._noise_log_likelihood_value = noise_log_likelihood_gamma - (n_dof - 1) * np.log(noise_gamma)
 
         return self._noise_log_likelihood_value
 
-    def empirical_log_likelihood(self):
+    def _empirical_log_likelihood(self, parameters):
         
         waveform_polarizations = \
-            self.waveform_generator.frequency_domain_strain(self.parameters)
+            self.waveform_generator.frequency_domain_strain(parameters)
 
         if waveform_polarizations is None:
             return np.nan_to_num(-np.inf)
@@ -188,10 +192,71 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
         self.parameters.update(self.get_sky_frame_parameters())
 
         gamma = self._compute_gamma(waveform_polarizations)
+        
+        loglike_gamma = self.loglikelihood_object.score_samples(np.array(gamma).reshape(1, -1) )[0]
 
-        return self.loglikelihood_object.score_samples(np.array(gamma).reshape(1, -1) )[0]
+        n_frequency_bins = self.interferometers[0].frequency_mask.sum()
+        n_detectors = len(self.interferometers)
+
+        n_dof = 2*n_frequency_bins*n_detectors
+
+        loglike_data = loglike_gamma - (n_dof - 1) * np.log(gamma)
+
+        return loglike_data
 
         
     def log_likelihood(self):
 
-        return self.empirical_log_likelihood()
+        return self._empirical_log_likelihood(self.parameters)
+
+
+    def save_likelihood(self, outdir):
+
+        dof = 2 * len(self.interferometers) * self.interferometers[0].duration * \
+            (self.interferometers[0].maximum_frequency - self.interferometers[0].minimum_frequency )
+
+        ## this is the mode of the standard Gaussian distributon
+        ## we calculate it to find plotting bounds
+        mode = np.sqrt(dof - 2)
+
+        lower_limit = max( np.sqrt(dof - 8 * np.sqrt(2 *dof)) , 0)
+        upper_limit = np.sqrt(dof + 8 * np.sqrt(2 *dof))
+
+        gamma_array = np.arange(lower_limit, upper_limit, 0.01)
+        gamma_array = gamma_array.reshape(gamma_array.size, 1)
+        delta_gamma = gamma_array[1, 0] - gamma_array[0, 0]
+
+        # the Gaussian likelihood in gamma is a chi^2
+        gaussian_loglike = (dof - 2 ) * np.log(gamma_array) - gamma_array**2 / 2
+        gaussian_like = np.exp(gaussian_loglike - gaussian_loglike.max())
+ 
+        gaussian_like /= np.trapz(gaussian_like, dx=delta_gamma, axis=0)
+
+        plt.plot(gamma_array, 
+                np.exp(self.loglikelihood_object.score_samples(gamma_array)), 
+                label='Empirical likelihood', 
+                lw=1.0, 
+                color='k')
+
+        plt.plot(gamma_array, gaussian_like, 
+                 label='gaussian likelihood', 
+                 lw=1.0, color='#D55E00', ls='-.')
+
+        plt.xlabel('$\gamma$')
+        plt.ylabel('PDF')
+        plt.axvline(mode, label='theoretical mode', color='b', ls='--')
+        plt.ylim([0, 0.6])
+        plt.xlim([lower_limit, upper_limit])
+        plt.legend()
+        plt.grid(visible=None)
+        plt.savefig(outdir + '/gamma_histogram.png', dpi=250)
+        plt.close()
+
+
+
+        with open(outdir + '/likelihoods.pkl',  'wb') as f:
+        
+            data = {}
+            data['kde'] = self.loglikelihood_object
+            data['gamma_arr'] = gamma_array
+            data['gaussian_like'] = gaussian_like
