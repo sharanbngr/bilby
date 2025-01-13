@@ -1,7 +1,7 @@
 import numpy as np
 from .base import GravitationalWaveTransient
 import pickle
-from ..utils import noise_weighted_inner_product, zenith_azimuth_to_ra_dec, ln_i0
+from ..utils import noise_weighted_inner_product, optimal_snr_squared
 from scipy.stats import chi2
 import bilby
 from gwpy.timeseries import TimeSeries
@@ -15,12 +15,12 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
 
     def __init__(
             self, interferometers, waveform_generator, likelihood_file, time_marginalization=False,
-            distance_marginalization=False, phase_marginalization=False, calibration_marginalization=False, priors=None,
-            distance_marginalization_lookup_table=None, calibration_lookup_table=None,
+            distance_marginalization=False, phase_marginalization=False, calibration_marginalization=False, 
+            priors=None, distance_marginalization_lookup_table=None, calibration_lookup_table=None,
             number_of_response_curves=1000, starting_index=0, jitter_time=True, reference_frame="sky",
-            time_reference="geocenter", generate_gaussian_background=False
+            time_reference="geocenter", generate_gaussian_background=False, empirical_minimum_frequency=20.0, 
+            empirical_maximum_frequency=100.0
         ):
-
 
         super(EmpiricalGravitationalWaveTransient, self).__init__(
             interferometers=interferometers,
@@ -34,6 +34,10 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
             reference_frame=reference_frame,
             time_reference=time_reference)
 
+        self.empirical_minimum_frequency = empirical_minimum_frequency
+        self.empirical_maximum_frequency = empirical_maximum_frequency
+
+        self.calc_frequency_masks_and_ndof()
 
         if generate_gaussian_background:
             self.loglikelihood_object = self._gaussian_background_distribution(interferometers)
@@ -43,6 +47,25 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
                 gamma_dists = pickle.load(f)
                 self.loglikelihood_object = gamma_dists['kde']
 
+
+
+    def calc_frequency_masks_and_ndof(self):
+
+        for interferometer in self.interferometers:
+            interferometer.gamma_frequency_mask = np.logical_and(
+                interferometer.frequency_array>=self.empirical_minimum_frequency, 
+                interferometer.frequency_array<=self.empirical_maximum_frequency,
+                )
+            
+            interferometer.gaussian_frequency_mask = np.logical_and(
+                ~interferometer.gamma_frequency_mask, interferometer.frequency_mask)
+
+        n_frequency_bins = self.interferometers[0].gamma_frequency_mask.sum()
+        n_detectors = len(self.interferometers)
+
+        self.n_dof = 2*n_frequency_bins*n_detectors
+
+        return
 
     def _gaussian_background_distribution(self, interferometers):
         ifo_list = []
@@ -57,7 +80,8 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
         analysis_duration = int(ifo.duration)
         background_duration = 128 * analysis_duration
         sampling_frequency = int(ifo.sampling_frequency)
-        minimum_frequency, maximum_frequency = ifo.minimum_frequency, ifo.maximum_frequency
+        minimum_frequency = self.empirical_minimum_frequency
+        maximum_frequency = self.empirical_maximum_frequency
         start_time = ifo.start_time - 0.5*background_duration
 
         interferometers_bknd.set_strain_data_from_power_spectral_densities(
@@ -150,84 +174,148 @@ class EmpiricalGravitationalWaveTransient(GravitationalWaveTransient):
                         bandwidth='scott').fit(gamma.reshape(gamma.size, 1))
 
         return kde
-
-        
             
-    def _compute_gamma(self, waveform_polarizations):
+    def _masked_inner_products(self, frequency_domain_strain, 
+                               signal, power_spectral_density, mask):
 
-        d_inner_h, h_inner_h = self._calculate_inner_products(waveform_polarizations)
+        inner_products = {'d_inner_d':0.0, 
+                          'd_inner_h':0.0, 
+                          'h_inner_h': 0.0}
 
-        # calling method from GravitationalWaveTransient which is really calcualting the data inner product
-        d_inner_d = -2 * self._calculate_noise_log_likelihood()
+        inner_products['d_inner_d'] = noise_weighted_inner_product(frequency_domain_strain[mask], 
+                                                                     frequency_domain_strain[mask], 
+                                                                     power_spectral_density[mask], 
+                                                                     self.waveform_generator.duration).real
 
-        return  np.sqrt(d_inner_d  + h_inner_h - 2 * np.real(d_inner_h))
+        inner_products['d_inner_h'] = noise_weighted_inner_product(frequency_domain_strain[mask], 
+                                                                   signal[mask], power_spectral_density[mask], 
+                                                                   self.waveform_generator.duration) 
+        
+        inner_products['h_inner_h'] = optimal_snr_squared(signal=signal[mask], 
+            power_spectral_density=power_spectral_density[mask], duration=self.waveform_generator.duration).real
+
+        return inner_products
 
 
     def noise_log_likelihood(self):
         
         if self._noise_log_likelihood_value is None:
 
-            # calling method from GravitationalWaveTransient which is really calcualting the data inner product
-            noise_gamma = np.sqrt(-2 * self._calculate_noise_log_likelihood())
+            noise_gamma_squared = 0
+            gaussian_noise_logl = 0
 
-            n_frequency_bins = self.interferometers[0].frequency_mask.sum()
-            n_detectors = len(self.interferometers)
+            for interferometer in self.interferometers:
 
-            n_dof = 2*n_frequency_bins*n_detectors
+                noise_gamma_squared += noise_weighted_inner_product(
+                    interferometer.frequency_domain_strain[interferometer.gamma_frequency_mask], 
+                    interferometer.frequency_domain_strain[interferometer.gamma_frequency_mask], 
+                    interferometer.power_spectral_density_array[interferometer.gamma_frequency_mask], 
+                    self.waveform_generator.duration).real
 
-            noise_log_likelihood_gamma = self.loglikelihood_object.score_samples(np.array(noise_gamma).reshape(1, -1) )[0]
 
-            self._noise_log_likelihood_value = noise_log_likelihood_gamma - (n_dof - 1) * np.log(noise_gamma)
+                gaussian_noise_logl -= 0.5*noise_weighted_inner_product(
+                    interferometer.frequency_domain_strain[interferometer.gaussian_frequency_mask], 
+                    interferometer.frequency_domain_strain[interferometer.gaussian_frequency_mask], 
+                    interferometer.power_spectral_density_array[interferometer.gaussian_frequency_mask], 
+                    self.waveform_generator.duration).real
+
+            noise_gamma = np.sqrt(noise_gamma_squared)
+
+            gamma_log_likelihood = self.loglikelihood_object.score_samples(
+                                    np.array(noise_gamma).reshape(1, -1))[0] - (self.n_dof- 1) * np.log(noise_gamma)
+
+
+            self._noise_log_likelihood_value = gamma_log_likelihood + gaussian_noise_logl
 
         return self._noise_log_likelihood_value
 
-    def _empirical_log_likelihood(self, parameters):
+    def _empirical_log_likelihood(self, waveform_polarizations):
         
+        d_inner_d = 0.0 
+        d_inner_h = 0.0 
+        h_inner_h = 0.0
+
+        for interferometer in self.interferometers:
+            signal = self._compute_full_waveform(
+                signal_polarizations=waveform_polarizations,
+                interferometer=interferometer,
+                )
+
+            inner_products = self._masked_inner_products(interferometer.frequency_domain_strain, 
+                               signal, interferometer.power_spectral_density_array, 
+                               interferometer.gamma_frequency_mask)
+
+            d_inner_d += inner_products['d_inner_d']
+            d_inner_h += inner_products['d_inner_h']
+            h_inner_h += inner_products['h_inner_h']
+
+
+        gamma = np.sqrt(d_inner_d  + h_inner_h - 2 * np.real(d_inner_h))
+        #gamma = self._compute_gamma(waveform_polarizations)
+        
+        loglike_gamma = self.loglikelihood_object.score_samples(np.array(gamma).reshape(1, -1) )[0]
+
+        loglike_data = loglike_gamma - (self.n_dof - 1) * np.log(gamma)
+
+        return loglike_data
+
+    def _gaussian_log_likelihood(self, waveform_polarizations):
+
+        d_inner_d = 0.0 
+        d_inner_h = 0.0 
+        h_inner_h = 0.0
+
+        for interferometer in self.interferometers:
+            signal = self._compute_full_waveform(
+                signal_polarizations=waveform_polarizations,
+                interferometer=interferometer,
+                )
+
+
+            inner_products = self._masked_inner_products(interferometer.frequency_domain_strain, 
+                               signal, interferometer.power_spectral_density_array,
+                               interferometer.gaussian_frequency_mask)
+
+            d_inner_d += inner_products['d_inner_d']
+            d_inner_h += inner_products['d_inner_h']
+            h_inner_h += inner_products['h_inner_h']
+
+
+        log_likelihood = -0.5 * (d_inner_d + h_inner_h - 2 * np.real(d_inner_h))
+
+        return log_likelihood
+
+        
+    def log_likelihood(self):
+
         waveform_polarizations = \
-            self.waveform_generator.frequency_domain_strain(parameters)
+            self.waveform_generator.frequency_domain_strain(self.parameters)
 
         if waveform_polarizations is None:
             return np.nan_to_num(-np.inf)
 
         self.parameters.update(self.get_sky_frame_parameters())
 
-        gamma = self._compute_gamma(waveform_polarizations)
-        
-        loglike_gamma = self.loglikelihood_object.score_samples(np.array(gamma).reshape(1, -1) )[0]
+        empirical_log_likelihood = self._empirical_log_likelihood(waveform_polarizations)
+        gaussian_log_likelihood = self._gaussian_log_likelihood(waveform_polarizations)
 
-        n_frequency_bins = self.interferometers[0].frequency_mask.sum()
-        n_detectors = len(self.interferometers)
-
-        n_dof = 2*n_frequency_bins*n_detectors
-
-        loglike_data = loglike_gamma - (n_dof - 1) * np.log(gamma)
-
-        return loglike_data
-
-        
-    def log_likelihood(self):
-
-        return self._empirical_log_likelihood(self.parameters)
-
+        return empirical_log_likelihood + gaussian_log_likelihood
 
     def save_likelihood(self, outdir):
 
-        dof = 2 * len(self.interferometers) * self.interferometers[0].duration * \
-            (self.interferometers[0].maximum_frequency - self.interferometers[0].minimum_frequency )
-
         ## this is the mode of the standard Gaussian distributon
         ## we calculate it to find plotting bounds
-        mode = np.sqrt(dof - 2)
+        mode = np.sqrt(self.n_dof - 2)
 
-        lower_limit = max( np.sqrt(dof - 8 * np.sqrt(2 *dof)) , 0)
-        upper_limit = np.sqrt(dof + 8 * np.sqrt(2 *dof))
+        lower_limit = max( np.sqrt(self.n_dof - 8 * np.sqrt(2*self.n_dof)) , 0)
+        upper_limit = np.sqrt(self.n_dof + 8 * np.sqrt(2*self.n_dof))
 
         gamma_array = np.arange(lower_limit, upper_limit, 0.01)
         gamma_array = gamma_array.reshape(gamma_array.size, 1)
         delta_gamma = gamma_array[1, 0] - gamma_array[0, 0]
 
         # the Gaussian likelihood in gamma is a chi^2
-        gaussian_loglike = (dof - 2 ) * np.log(gamma_array) - gamma_array**2 / 2
+        gaussian_loglike = (self.n_dof - 2 ) * np.log(gamma_array) - gamma_array**2 / 2
         gaussian_like = np.exp(gaussian_loglike - gaussian_loglike.max())
  
         gaussian_like /= np.trapz(gaussian_like, dx=delta_gamma, axis=0)
